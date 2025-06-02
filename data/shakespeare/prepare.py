@@ -31,3 +31,26 @@ val_ids.tofile(os.path.join(os.path.dirname(__file__), 'val.bin'))
 
 # train.bin has 301,966 tokens
 # val.bin has 36,059 tokens
+
+# Find max token length in characters
+all_token_ids = set(train_ids.tolist() + val_ids.tolist())
+
+max_len = 0
+longest_token = ""
+
+for token_id in all_token_ids:
+    token_str = enc.decode([token_id])
+    token_len = len(token_str)
+    if token_len > max_len:
+        max_len = token_len
+        longest_token = token_str
+
+print(f"The longest token is {repr(longest_token)} with {max_len} characters")
+
+with open(input_file_path, 'r', encoding='utf-8') as f:
+    data = f.read()
+
+charset = sorted(list(set(data)))
+
+print(f"Character set ({len(charset)} characters):")
+print(charset)

@@ -1,14 +1,12 @@
 import time
 
 out_dir = 'out-shakespeare'
-eval_interval = 5
-eval_iters = 40
 wandb_log = False # feel free to turn on
-wandb_project = 'shakespeare'
-wandb_run_name = 'ft-' + str(time.time())
+eval_interval = 50 # keep frequent because we'll overfit
+eval_iters = 100
+log_interval = 10 # don't print too too often
 
 dataset = 'shakespeare'
-init_from = 'gpt2-xl' # this is the largest GPT-2 model
 
 # only save checkpoints if the validation loss improves
 always_save_checkpoint = False
@@ -18,8 +16,26 @@ always_save_checkpoint = False
 # shakespeare has 301,966 tokens, so 1 epoch ~= 9.2 iters
 batch_size = 1
 gradient_accumulation_steps = 32
-max_iters = 20
+max_iters = 3000
 
 # finetune at constant LR
-learning_rate = 3e-5
+learning_rate = 3e-4
 decay_lr = False
+device = 'mps'
+max_token_length = 16 + 2 # For <SOS> and <EOS> tokens
+
+n_layer = 4
+n_head = 4
+n_embd = 128
+block_size = 64
+dropout = 0.0
+charset = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+char_to_id = {ch: idx + 1 for idx, ch in enumerate(charset)}  # start indexing at 1
+char_to_id['<pad>'] = 0
+char_to_id['<SOS>'] = len(char_to_id)
+char_to_id['<EOS>'] = len(char_to_id)
+id_to_char = {idx: ch for ch, idx in char_to_id.items()}
+
+
+charset = sorted(set(charset))
+charset_size = len(charset) + 3

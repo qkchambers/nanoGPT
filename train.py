@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import tiktoken
 
 import numpy as np
 import torch
@@ -54,6 +55,12 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+charset_size = None
+max_token_length = None
+charset = None
+char_to_id = None
+enc = tiktoken.get_encoding("gpt2")
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -71,7 +78,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False #True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -111,6 +118,23 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+
+# Function to convert one token sequence to padded char ID tensor
+def tokens_to_char_tensor(token_list, pad_len):
+    char_ids_list = []
+    for token in token_list:
+        decoded_str = enc.decode([token])
+        char_ids = [char_to_id['<SOS>']] 
+        char_ids += [char_to_id.get(ch, 0) for ch in decoded_str]
+        char_ids += [char_to_id['<EOS>']]
+        
+        if len(char_ids) < pad_len:
+            char_ids += [0] * (pad_len - len(char_ids))
+        
+        char_ids_list.append(char_ids)
+
+    return torch.tensor(char_ids_list, dtype=torch.long)
+
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
@@ -123,6 +147,13 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    # I need to turn the token array into a charset array with padding
+    y2 = []
+    for iy in y:
+        y2.append(tokens_to_char_tensor(y[0].tolist(), max_token_length))
+
+    y = torch.stack(y2)
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -146,6 +177,11 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+model_args['charset_size'] = charset_size
+model_args['max_token_length'] = max_token_length
+id_to_char = {idx: ch for ch, idx in char_to_id.items()}
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -249,6 +285,7 @@ if wandb_log and master_process:
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
+tq0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
@@ -271,6 +308,11 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        file_log = True
+        if file_log:
+            t2 = time.time()
+            with open('log.csv', 'a') as f:
+                f.write(f"{iter_num},{losses['train']},{losses['val']},{t2-tq0}\n")
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

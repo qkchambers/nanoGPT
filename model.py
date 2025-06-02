@@ -15,6 +15,19 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
+import tiktoken
+
+enc = tiktoken.get_encoding("gpt2")
+
+# TODO Also exists in finetune_shakespeare.py, so maybe move to a common file
+charset = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+char_to_id = {ch: idx + 1 for idx, ch in enumerate(charset)}  # start indexing at 1
+char_to_id['<pad>'] = 0
+char_to_id['<SOS>'] = len(char_to_id)
+char_to_id['<EOS>'] = len(char_to_id)
+id_to_char = {idx: ch for ch, idx in char_to_id.items()}
+
+
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
@@ -114,6 +127,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    charset_size: int = 67  #TODO: just use len on charset
+    max_token_length: int = 16
 
 class GPT(nn.Module):
 
@@ -121,22 +136,33 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.charset_size is not None
+        assert config.max_token_length is not None
         self.config = config
 
+        # TODO: Try using mask for padding
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
+            wce = nn.Embedding(config.charset_size, config.n_embd), # TODO: test different n_embd
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        
+        # TODO: Maybe try seperate embedding for chars?
+        # 64 here was also n_embd
+        self.lstm = nn.LSTM(config.n_embd + config.n_embd, 128) # This needs to match n_embd?????
+        self.lm_head = nn.Linear(128, config.charset_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
+        # TODO this code zeroed everything out for some reason
+        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        #self.transformer.wce.weight = self.lm_head.weight 
+        
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -170,6 +196,10 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
+        batch_size = idx.size(0)
+        #seq_len = targets.size(0)
+        
+
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
         pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
@@ -181,16 +211,52 @@ class GPT(nn.Module):
             x = block(x)
         x = self.transformer.ln_f(x)
 
-        if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
 
-        return logits, loss
+        """
+        We want to split the output logits into max_token_length pieces to decode the characters
+        
+        tok_emb [batch, context_size, embedding_dim] [1, 256, 128]
+        char_embeddings [batch, context_size, number_of_characters, embedding_dim] [1, 256, 16, 128]
+
+        """
+    
+        if targets is not None:
+            # TODO: should this be done after getting the embeddings?
+            # Use a loss function like nn.CrossEntropyLoss(ignore_index=pad_token_id) so padding tokens don’t contribute to the loss.
+            # Do most tokens start with ' ' or \n?
+            char_inputs = targets[:, :, :-1]
+            char_targets = targets[:, :, 1:]
+            c = char_inputs.size(2)
+
+            x_expanded = x.unsqueeze(2).repeat(1, 1, c, 1)  # (b, t, c, n_embd)
+            # if we are given some desired targets also calculate the loss
+            char_input_embeddings = self.transformer.wce(char_inputs)
+
+            lstm_input = torch.cat([x_expanded, char_input_embeddings], dim=-1) 
+            # Prepare for LSTM: reshape to (c, b * t, input_size)
+            lstm_input = lstm_input.permute(2, 0, 1, 3).reshape(c, b * t, -1)
+            
+            h0 = torch.zeros(1, b*t, self.lstm.hidden_size, device=device)
+            c0 = torch.zeros(1, b*t, self.lstm.hidden_size, device=device)
+
+            lstm_out, _  = self.lstm(lstm_input, (h0, c0))
+
+            logits = self.lm_head(lstm_out)
+
+
+            # Compute loss if targets provided
+            if char_targets is not None:
+                char_targets = char_targets.permute(2, 0, 1).reshape(c, b * t)  # (char_seq_len, b * t)
+
+                loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),  # (char_seq_len * b * t, vocab_size)
+                    char_targets.reshape(-1),          # (char_seq_len * b * t,)
+                    ignore_index=0
+                )
+                return logits, loss
+
+
+        return x, None
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -303,7 +369,7 @@ class GPT(nn.Module):
         return mfu
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, device, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -313,18 +379,98 @@ class GPT(nn.Module):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            x, _ = self(idx_cond)
+            next_char = char_to_id['<SOS>'] 
+
+            x = x[:, -1:, :]
+            hidden = None
+            char_sequence = []
+            while(next_char != 67):
+                next_char = self.transformer.wce(torch.tensor([next_char], device=device))
+                next_char = next_char.unsqueeze(0)
+                lstm_input = torch.cat([x, next_char], dim=-1)  # (1, 1, token+char dim)
+
+                output, hidden = self.lstm(lstm_input, hidden)  # output: (1, 1, hidden_dim)
+
+                logits = self.lm_head(output)  # (1, char_vocab_size)
+                probs = torch.softmax(logits, dim=-1)
+                next_char = torch.argmax(probs, dim=-1)
+                char_sequence.append(next_char.item())
+
+            token_ids = chars_to_token(char_sequence)
+            
+
+            """
             # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
+            # logits = logits[:, -1, :] / temperature
+            logits = logits / temperature
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
             probs = F.softmax(logits, dim=-1)
+            
+            
+            # TODO: Decoding options, 
+            # 1. Decode a character and then put back through the model (backtrack over last token to see if it can be
+            # combined to make a longer token))
+            # 2. Take tokens until no token exists for that string or reach a 0
+            # * Test argmax
+            # 3. Use an output positional decoding to decode the characters
+            # Diffusion decoding
+            
+
             # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
+            probs = probs.view(-1, probs.size(-1)) 
+            char_predictions = torch.multinomial(probs, num_samples=1)
+            #arg_max_preds = torch.argmax(logits, dim=-1).reshape(16, 1)
+            idx_next = next_token(char_predictions)
+            """
             # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+            #idx = torch.cat((idx, idx_next), dim=1)
+            idx = torch.cat((idx, torch.tensor(token_ids, device=device).unsqueeze(0)), dim=1)
 
         return idx
+    
+def chars_to_token(char_list):
+    token = ''
+    char_list = char_list[:-1]  
+    for char in char_list:
+        token += id_to_char[char]
+
+    token_ids = enc.encode(token)
+
+    return token_ids
+
+
+
+# TODO: I made this so that it finds the first padding and then removes everything after it.
+# It then creates a string and checks the encoder for each substring until it finds a single token.
+def next_token(char_predictions):
+    token = ''
+    possible_token = []
+
+    # Find positions where tensor is zero
+    zero_indices = (char_predictions == 0).nonzero(as_tuple=True)[0]
+
+    if len(zero_indices) > 0:
+        first_zero_idx = zero_indices[0].item()
+        # Slice up to (but not including) the first 0
+        possible_token = char_predictions[:first_zero_idx]
+    else:
+        # If there is no zero, keep entire tensor
+        possible_token = char_predictions
+
+    for char in possible_token:
+        token += id_to_char[char.item()]
+
+    max_token = []
+    for i in range(len(token)):
+        substring = token if i == 0 else token[:-i]
+        max_token = enc.encode(substring)
+        if len(max_token) == 1:
+            break
+
+
+    return torch.tensor([max_token], device="mps")

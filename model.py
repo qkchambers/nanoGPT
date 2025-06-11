@@ -279,71 +279,60 @@ class GPT(nn.Module):
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
+            
     def forward(self, idx, targets=None):
         device = idx.device
-        b, t = idx.size()
-        t = t-1
+        B, T = idx.size()
+        t = T - 1  # exclude the last token for autoregressive training
 
         assert t <= self.config.block_size
-        pos = torch.arange(0, t, dtype=torch.long, device=device)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # [t]
 
         # --- Subword Transformer ---
-        tok_emb = self.transformer.wte(idx)
-        #a = tok_emb[:, 1:, :]
-        pos_emb = self.transformer.wpe(pos)
-        x = self.transformer.drop(tok_emb[:, :-1] + pos_emb)
+        tok_emb = self.transformer.wte(idx)                         # [B, T, D]
+        tok_emb = tok_emb[:, :-1, :]                                # [B, T-1, D]
+        pos_emb = self.transformer.wpe(pos)                         # [T-1, D]
+        x = self.transformer.drop(tok_emb + pos_emb)                # [B, T-1, D]
+
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)  # latent vectors (B, T, D)
+        x = self.transformer.ln_f(x)                                # [B, T-1, D]
 
         if targets is not None:
-            #B, T, C = targets.shape
+            # --- Character-level decoding ---
+            # targets: [B, T-1, C+1] → input chars (C) and target chars (C)
+            char_inputs = targets[:, :, :-1]                        # [B, T-1, C]
+            B, T1, C = char_inputs.shape
 
-            char_inputs = targets[:, :, :-1]
-            B, T, C = char_inputs.shape 
-            char_input_flat = char_inputs.reshape(B * t, C)  # [B*T, C]
-            char_emb = self.char_embedding(char_input_flat)  # [B*T, C, D]
+            # Embed characters
+            char_emb = self.char_embedding(char_inputs)             # [B, T-1, C, D']
+            char_pos = torch.arange(C, device=device).unsqueeze(0).unsqueeze(0)  # [1, 1, C]
+            char_pos_emb = self.char_pos_emb(char_pos)              # [1, 1, C, D']
+            char_emb = char_emb + char_pos_emb                      # [B, T-1, C, D']
 
-            # Positional embeddings
-            pos = torch.arange(C, device=device).unsqueeze(0).repeat(B * t, 1)  # [B*T, C]
-            char_pos_emb = self.char_pos_emb(pos)
-            char_emb = char_emb + char_pos_emb  # [B*T, C, D]
+            # Flatten to [B*(T-1), C, D'] for decoder
+            char_emb = char_emb.contiguous().view(B * T1, C, -1)
 
-            # Cross-attend to latent vectors from subword model
-            memory = self.adapter(x)
-            memory = memory.reshape(B * t, 1, -1)  # [B*T, 1, D]
+            # Adapt and flatten memory
+            memory = self.adapter(x)                                # [B, T-1, D']
+            memory = memory.contiguous().view(B * T1, 1, -1)        # [B*(T-1), 1, D']
 
-            #tgt_mask = self.generate_causal_mask(C, device)
-            y = self.char_decoder(tgt=char_emb, memory=memory)  # [B*T, C, D]
+            # Decode
+            y = self.char_decoder(tgt=char_emb, memory=memory)      # [B*(T-1), C, D']
 
-            logits = self.lm_head(y)  # [B*T, C, vocab_size]
-            logits_flat = logits.reshape(B*T*C, self.config.charset_size)  # [(B*T)*C, vocab_size]
-            
-            target_out = targets[:, :, 1:].reshape(B*T, C).reshape(B*T*C)  # [(B*T)*C]
+            # Output logits
+            logits = self.lm_head(y)                                # [B*(T-1), C, charset_size]
+            logits_flat = logits.reshape(B * T1 * C, self.config.charset_size)
 
-            #loss = F.cross_entropy(logits_flat[loss_mask], target_out[loss_mask], ignore_index=0)
+            # Targets (next chars): [B, T-1, C]
+            target_out = targets[:, :, 1:].reshape(B * T1 * C)
 
-            # tok_emb.reshape(12*128*4, 32)
-            #similarity_target = torch.ones(12*128*4, device=device)
-            #auxiliary_loss = self.aux_loss_fn(a.reshape(12*128*4, 32), char_emb[:, 1:, :].reshape(12*128*4, 32), similarity_target)
-            #char_rep = y[:, 2:-1, :]
-            #reconstructed_latent = self.char_to_latent(char_rep.reshape(char_rep.size(0), -1))
-            #recon_loss = F.mse_loss(reconstructed_latent, tok_emb[:, 1:].reshape(12*128, 128))
-
-
-            # Create mask to ignore the first 4 characters
-            #loss_mask = torch.ones_like(target_out, dtype=torch.bool)
-            #loss_mask = loss_mask.view(-1, 7)
-            #loss_mask[:, :3] = False  # ignore first 4 characters
-            #loss_mask = loss_mask.view(-1)
-
-            loss = F.cross_entropy(logits_flat, target_out, ignore_index=0) #+ recon_loss
+            loss = F.cross_entropy(logits_flat, target_out, ignore_index=0)
         else:
-            logits = x
+            logits = x  # just returning latent subword output if no targets
             loss = None
 
-        return x, loss
+        return logits, loss
 
 
     def crop_block_size(self, block_size):

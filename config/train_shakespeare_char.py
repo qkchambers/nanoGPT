@@ -4,7 +4,7 @@
 out_dir = 'out-shakespeare-char'
 eval_interval = 20 # keep frequent because we'll overfit
 eval_iters = 100
-log_interval = 10 # don't print too too often
+#log_interval = 10 # don't print too too often
 
 # we expect to overfit on this small dataset, so only save when val improves
 always_save_checkpoint = False

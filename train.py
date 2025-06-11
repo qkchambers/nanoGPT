@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+from torch.nn import functional as F
 
 import numpy as np
 import torch
@@ -34,7 +35,7 @@ from model import GPTConfig, GPT
 # I/O
 out_dir = 'out'
 eval_interval = 2000
-log_interval = 1
+log_interval = 100
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -241,6 +242,15 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
+
+def log_all(iter_num, train_loss, val_loss, lr, val_perplexity):
+    log_path = os.path.join(out_dir, 'log.txt')
+    with open(log_path, 'a') as f:
+        f.write(f"{iter_num},{train_loss},{val_loss},{lr},{val_perplexity}\n")
+        f.flush()
+        os.fsync(f.fileno())  # ensure the log is written to disk immediately
+    print(f"logged to {log_path}")
+
 # logging
 if wandb_log and master_process:
     import wandb
@@ -252,6 +262,7 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+start = time.time()
 while True:
 
     # determine and set the learning rate for this iteration
@@ -262,7 +273,17 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        with torch.no_grad():
+            X, Y = get_batch('val')
+            logits, loss = model(X, Y)
+            B, T, V = logits.shape
+
+            logits_flat = logits.view(B * T, V)        # [B*T, vocab_size]
+            targets_flat = Y.view(B * T) 
+
+            val_loss = F.cross_entropy(logits_flat, targets_flat, reduction='mean')
+            val_perplexity = torch.exp(val_loss)
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, perp: {val_perplexity}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -271,6 +292,9 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        log_all(iter_num, losses['train'], losses['val'], lr, val_perplexity)
+
+
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -332,5 +356,9 @@ while True:
     if iter_num > max_iters:
         break
 
+
+end = time.time()
+print(f"training took {end - start:.2f} seconds")
 if ddp:
+    
     destroy_process_group()

@@ -309,16 +309,15 @@ class GPT(nn.Module):
 
             # Positional embeddings
             pos = torch.arange(C, device=device).unsqueeze(0).repeat(B * t, 1)  # [B*T, C]
+            print("char_pos shape:", pos.shape)
+            print("char_pos max:", pos.max().item())
+            print("char_pos_emb num embeddings:", self.char_pos_emb.num_embeddings)
             char_pos_emb = self.char_pos_emb(pos)
             char_emb = char_emb + char_pos_emb  # [B*T, C, D]
 
             # Cross-attend to latent vectors from subword model
             memory = self.adapter(x)
             memory = memory.reshape(B * t, 1, -1)  # [B*T, 1, D]
-
-            print("char_pos shape:", pos.shape)
-            print("char_pos max:", pos.max().item())
-            print("char_pos_emb num embeddings:", self.char_pos_emb.num_embeddings)
 
             tgt_mask = self.generate_causal_mask(C, device)
             y = self.char_decoder(tgt=char_emb, memory=memory, tgt_mask=tgt_mask)  # [B*T, C, D]

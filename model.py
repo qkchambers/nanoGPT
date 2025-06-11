@@ -345,7 +345,7 @@ class GPT(nn.Module):
             logits = x
             loss = None
 
-        return x, loss
+        return logits, loss
 
 
     def crop_block_size(self, block_size):

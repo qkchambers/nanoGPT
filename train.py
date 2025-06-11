@@ -350,9 +350,10 @@ while True:
             X, Y = get_batch('val')
             logits, loss = model(X, Y)
             B, T, V = logits.shape
+            #V = V-1
 
             logits_flat = logits.view(B * T, V)        # [B*T, vocab_size]
-            targets_flat = Y.view(B * T) 
+            targets_flat = Y[:, :, 1:].reshape(B * T)
 
             val_loss = F.cross_entropy(logits_flat, targets_flat, reduction='mean')
             val_perplexity = torch.exp(val_loss)

@@ -227,7 +227,7 @@ class GPT(nn.Module):
         self.char_decoder = TransformerDecoder(decoder_layer, num_layers=config.n_layer)
 
         self.char_embedding = nn.Embedding(config.charset_size, config.n_embd // 4)
-        self.char_pos_emb = nn.Embedding(4, config.n_embd // 4)
+        self.char_pos_emb = nn.Embedding(7, config.n_embd // 4)
 
         self.lm_head = nn.Linear(config.n_embd // 4, config.charset_size, bias=False)
 

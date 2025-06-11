@@ -309,9 +309,6 @@ class GPT(nn.Module):
 
             # Positional embeddings
             pos = torch.arange(C, device=device).unsqueeze(0).repeat(B * t, 1)  # [B*T, C]
-            print("char_pos shape:", pos.shape)
-            print("char_pos max:", pos.max().item())
-            print("char_pos_emb num embeddings:", self.char_pos_emb.num_embeddings)
             char_pos_emb = self.char_pos_emb(pos)
             char_emb = char_emb + char_pos_emb  # [B*T, C, D]
 

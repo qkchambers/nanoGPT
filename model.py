@@ -223,9 +223,7 @@ class GPT(nn.Module):
             batch_first=True
         )
 
-        print("char_pos shape:", char_pos.shape)
-        print("char_pos max:", char_pos.max().item())
-        print("char_pos_emb num embeddings:", self.char_pos_emb.num_embeddings)
+    
         self.char_decoder = TransformerDecoder(decoder_layer, num_layers=config.n_layer)
 
         self.char_embedding = nn.Embedding(config.charset_size, config.n_embd // 4)
@@ -317,6 +315,10 @@ class GPT(nn.Module):
             # Cross-attend to latent vectors from subword model
             memory = self.adapter(x)
             memory = memory.reshape(B * t, 1, -1)  # [B*T, 1, D]
+
+            print("char_pos shape:", pos.shape)
+            print("char_pos max:", pos.max().item())
+            print("char_pos_emb num embeddings:", self.char_pos_emb.num_embeddings)
 
             tgt_mask = self.generate_causal_mask(C, device)
             y = self.char_decoder(tgt=char_emb, memory=memory, tgt_mask=tgt_mask)  # [B*T, C, D]

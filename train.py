@@ -85,6 +85,44 @@ exec(open('configurator.py').read()) # overrides from command line or config fil
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
 
+
+import json
+import pickle
+import numpy as np
+
+# Load vocab
+with open("vocab.json", "r") as f:
+    vocab = json.load(f)
+
+with open("char_vocab.json", "r") as f:
+    char_to_id = json.load(f)
+id_to_char = {int(i): ch for ch, i in char_to_id.items()}
+
+# Rebuild mappings
+chunk_to_id = {chunk: i for i, chunk in enumerate(vocab)}
+id_to_chunk = {i: chunk for i, chunk in enumerate(vocab)}
+
+def encode(text, k=4):
+    """Convert raw string into list of token IDs (with padding)."""
+    chunks = [text[i:i+k] for i in range(0, len(text), k)]
+    if len(chunks[-1]) < k:
+        chunks[-1] = chunks[-1].ljust(k, '\0')  # pad with nulls
+    return [chunk_to_id[chunk] for chunk in chunks]
+
+def decode(ids):
+    """Convert list of token IDs back into a string."""
+    chunks = [id_to_chunk[i] for i in ids]
+    return ''.join(chunk.rstrip('\0') for chunk in chunks)  # remove padding
+
+def encode_chars(text):
+    """Convert string to list of character IDs."""
+    return [char_to_id.get(c, 0) for c in text]  # unknown chars map to 0 (pad)
+
+def decode_chars(id_list):
+    """Convert list of character IDs back to string."""
+    return ''.join(id_to_char.get(i, '') for i in id_list if i != 0)
+
+
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
 if ddp:
@@ -120,20 +158,20 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 
 # Function to convert one token sequence to padded char ID tensor
-def tokens_to_char_tensor(token_list, pad_len):
-    char_ids_list = []
-    for token in token_list:
-        decoded_str = enc.decode([token])
-        char_ids = [char_to_id['<SOS>']] 
-        char_ids += [char_to_id.get(ch, 0) for ch in decoded_str]
-        char_ids += [char_to_id['<EOS>']]
-        
-        if len(char_ids) < pad_len:
-            char_ids += [0] * (pad_len - len(char_ids))
-        
-        char_ids_list.append(char_ids)
+def tokens_to_char_ids(token_ids, id_to_token, char_to_id):
+    B, T = token_ids.shape
+    C = len(id_to_token[0])  # length of each token (e.g., 4)
 
-    return torch.tensor(char_ids_list, dtype=torch.long)
+    char_id_tensor = torch.zeros((B, T-1, C*2), dtype=torch.long)
+
+    for b in range(B):
+        for t in range(T-1):
+            token_pair = id_to_token[token_ids[b, t].item()] + id_to_token[token_ids[b, t+1].item()] 
+
+            for c in range(C*2):
+                char_id_tensor[b, t, c] = char_to_id[token_pair[c]]
+    
+    return char_id_tensor
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -145,14 +183,12 @@ def get_batch(split):
     else:
         data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
     ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    # I need to turn the token array into a charset array with padding
-    y2 = []
-    for iy in y:
-        y2.append(tokens_to_char_tensor(y[0].tolist(), max_token_length))
+    x = torch.stack([torch.from_numpy((data[i:i+1+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    char_targets = tokens_to_char_ids(y, id_to_chunk, char_to_id)
 
-    y = torch.stack(y2)
+    y = char_targets
 
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
@@ -188,7 +224,7 @@ if init_from == 'scratch':
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 31729
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':

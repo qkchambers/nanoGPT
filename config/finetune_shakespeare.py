@@ -1,7 +1,7 @@
 import time
 
 out_dir = 'out-shakespeare'
-eval_interval = 50
+eval_interval = 20
 eval_iters = 100
 wandb_log = False # feel free to turn on
 wandb_project = 'shakespeare'
@@ -16,9 +16,9 @@ always_save_checkpoint = False
 # the number of examples per iter:
 # 1 batch_size * 32 grad_accum * 1024 tokens = 32,768 tokens/iter
 # shakespeare has 301,966 tokens, so 1 epoch ~= 9.2 iters
-batch_size = 12
+batch_size = 32
 gradient_accumulation_steps = 32
-max_iters = 3000
+max_iters = 500
 compile = False
 device = 'cuda'
 

@@ -209,7 +209,6 @@ class GPT(nn.Module):
         assert config.max_token_length is not None
         self.config = config
 
-        # TODO: Try using mask for padding
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -334,12 +333,12 @@ class GPT(nn.Module):
 
 
             # Create mask to ignore the first 4 characters
-            loss_mask = torch.ones_like(target_out, dtype=torch.bool)
-            loss_mask = loss_mask.view(-1, 7)
-            loss_mask[:, :3] = False  # ignore first 4 characters
-            loss_mask = loss_mask.view(-1)
+            #loss_mask = torch.ones_like(target_out, dtype=torch.bool)
+            #loss_mask = loss_mask.view(-1, 7)
+            #loss_mask[:, :3] = False  # ignore first 4 characters
+            #loss_mask = loss_mask.view(-1)
 
-            loss = F.cross_entropy(logits_flat[loss_mask], target_out[loss_mask], ignore_index=0) #+ recon_loss
+            loss = F.cross_entropy(logits_flat, target_out, ignore_index=0) #+ recon_loss
         else:
             logits = x
             loss = None

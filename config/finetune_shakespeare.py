@@ -21,7 +21,7 @@ max_iters = 500
 # finetune at constant LR
 learning_rate = 3e-4
 decay_lr = False
-device = 'mps'
+device = 'cuda'
 max_token_length = 16 + 2 # For <SOS> and <EOS> tokens
 
 n_layer = 6

@@ -315,7 +315,7 @@ class GPT(nn.Module):
             memory = memory.reshape(B * t, 1, -1)  # [B*T, 1, D]
 
             tgt_mask = self.generate_causal_mask(C, device)
-            y = self.char_decoder(tgt=char_emb, memory=memory, tgt_mask=tgt_mask)  # [B*T, C, D]
+            y = self.char_decoder(tgt=char_emb, memory=memory)  # [B*T, C, D]
 
             logits = self.lm_head(y)  # [B*T, C, vocab_size]
             logits_flat = logits.reshape(B*T*C, self.config.charset_size)  # [(B*T)*C, vocab_size]

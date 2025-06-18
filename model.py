@@ -6,6 +6,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 2) huggingface/transformers PyTorch implementation:
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
+from torch.nn import TransformerDecoder, TransformerDecoderLayer, TransformerEncoder
 
 import math
 import inspect
@@ -14,6 +15,87 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import numpy as np
+import os
+
+import tiktoken
+
+import json
+import pickle
+import numpy as np
+
+# Load vocab
+with open("vocab.json", "r") as f:
+    vocab = json.load(f)
+
+with open("char_vocab.json", "r") as f:
+    char_to_id = json.load(f)
+id_to_char = {int(i): ch for ch, i in char_to_id.items()}
+
+# Rebuild mappings
+chunk_to_id = {chunk: i for i, chunk in enumerate(vocab)}
+id_to_chunk = {i: chunk for i, chunk in enumerate(vocab)}
+
+def encode(text, k=4):
+    """Convert raw string into list of token IDs (with padding)."""
+    chunks = [text[i:i+k] for i in range(0, len(text), k)]
+    if len(chunks[-1]) < k:
+        chunks[-1] = chunks[-1].ljust(k, '\0')  # pad with nulls
+    return [chunk_to_id[chunk] for chunk in chunks]
+
+def decode(ids):
+    """Convert list of token IDs back into a string."""
+    chunks = [id_to_chunk[i] for i in ids]
+    return ''.join(chunk.rstrip('\0') for chunk in chunks)  # remove padding
+
+def encode_chars(text):
+    """Convert string to list of character IDs."""
+    return [char_to_id.get(c, 0) for c in text]  # unknown chars map to 0 (pad)
+
+def decode_chars(id_list):
+    """Convert list of character IDs back to string."""
+    return ''.join(id_to_char.get(i, '') for i in id_list if i != 0)
+
+dataset = 'shakespeare'
+data_dir = os.path.join('data', dataset)
+block_size = 128
+batch_size = 1
+max_token_length = 4
+
+
+
+def get_batch(split, device):
+    # We recreate np.memmap every batch to avoid a memory leak, as per
+    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
+    if split == 'train':
+        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+    else:
+        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    char_targets = tokens_to_char_ids(y, id_to_chunk, char_to_id)
+
+    y = char_targets
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+# Function to convert one token sequence to padded char ID tensor
+def tokens_to_char_ids(token_ids, id_to_token, char_to_id):
+    B, T = token_ids.shape
+    C = len(id_to_token[0])  # length of each token (e.g., 4)
+
+    char_id_tensor = torch.zeros((B, T, C), dtype=torch.long)
+
+    for b in range(B):
+        for t in range(T):
+            token = id_to_token[token_ids[b, t].item()]
+            for c in range(C):
+                char_id_tensor[b, t, c] = char_to_id[token[c]]
+    
+    return char_id_tensor
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -114,6 +196,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    charset_size: int = 67  #TODO: just use len on charset
+    max_token_length: int = 16
 
 class GPT(nn.Module):
 
@@ -121,8 +205,11 @@ class GPT(nn.Module):
         super().__init__()
         assert config.vocab_size is not None
         assert config.block_size is not None
+        assert config.charset_size is not None
+        assert config.max_token_length is not None
         self.config = config
 
+        # TODO: Try using mask for padding
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -130,13 +217,32 @@ class GPT(nn.Module):
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
         ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # self.inner_layer = nn.Linear(config.n_embd, config.n_embd // 4, bias=False)
+        import copy
+        c2 = copy.deepcopy(config)
+        c2.n_layer = config.n_layer // 2
+        c2.n_head = config.n_head // 2
+        self.char_transformer = nn.ModuleDict(dict(
+            wce = nn.Embedding(config.charset_size, config.n_embd),
+            wpe = nn.Embedding(4, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([Block(c2) for _ in range(c2.n_layer)]),
+            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+        ))
+
+        self.lm_head = nn.Linear(config.n_embd, config.charset_size, bias=False)
+
+        
+        #self.lm_head = nn.Linear(config.n_embd, config.charset_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
-
+        # TODO this code zeroed everything out for some reason
+        #self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        #self.transformer.wce.weight = self.lm_head.weight 
+        
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
@@ -146,6 +252,27 @@ class GPT(nn.Module):
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
+
+    def generate_causal_mask(self, size, device):
+        # Generates an upper triangular mask to prevent attending to future positions
+        mask = torch.triu(torch.ones(size, size, device=device), diagonal=1)
+        mask = mask.masked_fill(mask == 1, float('-inf'))
+        return mask  # shape: (size, size)
+    
+    def random_char_mask(self, input_ids, mask_token_id, mask_prob=0.15, pad_token_id=0):
+        """
+        input_ids: (batch_size, seq_len) tensor of character token ids
+        Returns: masked_input_ids, labels
+        """
+        labels = input_ids.clone()
+        # Mask positions with probability `mask_prob`, ignoring padding
+        mask = (torch.rand(input_ids.shape, device=input_ids.device) < mask_prob) & (input_ids != pad_token_id)
+
+        masked_input_ids = input_ids.clone()
+        masked_input_ids[mask] = mask_token_id
+
+        labels[~mask] = -100  # non-masked positions are ignored in loss
+        return masked_input_ids, labels
 
     def get_num_params(self, non_embedding=True):
         """
@@ -170,27 +297,52 @@ class GPT(nn.Module):
     def forward(self, idx, targets=None):
         device = idx.device
         b, t = idx.size()
-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
 
-        # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        assert t <= self.config.block_size
+        pos = torch.arange(0, t, dtype=torch.long, device=device)
+
+        # --- Subword Transformer ---
+        tok_emb = self.transformer.wte(idx)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        x = self.transformer.ln_f(x) 
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            B, T, C = targets.shape  # B=batch, T=subwords, C=chars per subword
+            device = targets.device
+
+            pos = torch.arange(0, C-1, dtype=torch.long, device=device)
+
+            # --- character Transformer ---
+            char_emb = self.char_transformer.wce(targets[:, :, :-1])
+            char_pos_emb = self.char_transformer.wpe(pos)
+            combined = char_emb+char_pos_emb
+            combined = combined.reshape(B * T, C-1, -1)
+            memory = x.reshape(B * T, 1, -1)  # (B*T, 1, dim)
+            memory_broadcast = memory.expand(-1, C-1, -1)  
+            y = self.char_transformer.drop(combined + memory_broadcast)  
+            for block in self.char_transformer.h:
+                y = block(y)
+            y = self.char_transformer.ln_f(y) 
+
+
+            # Step 7: Project to logits
+            logits = self.lm_head(y)  # (B*T, C, vocab_size)
+
+            # Step 8: Compute loss
+            logits_flat = logits.reshape(-1, logits.size(-1))  # (B*T*C, vocab_size)
+            targets_flat = targets[:, :, 1:].reshape(-1)              # (B*T*C,)
+
+            loss = F.cross_entropy(logits_flat, targets_flat, ignore_index=-100)
+
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            logits = x
             loss = None
 
-        return logits, loss
+        return x, loss
+
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -302,29 +454,105 @@ class GPT(nn.Module):
         mfu = flops_achieved / flops_promised
         return mfu
 
+
+    def get_token_multinomial(self, x, current_chars, device):
+        next_token = [char_to_id['<SOS>']] 
+        flag = True
+        i = 1
+        while(flag):
+            chars_so_far = torch.tensor(next_token, dtype=torch.long, device=device)
+            chars_so_far = chars_so_far  # (1, i)
+            char_emb = self.char_transformer.wce(chars_so_far).unsqueeze(0)                               # (1, i, D)
+
+            # Positional embeddings
+            pos = torch.arange(i, device=device)                          # (1, i)
+            
+            char_pos_emb = self.char_transformer.wpe(pos).unsqueeze(0)
+            combined = char_emb+char_pos_emb + x
+            #combined = combined.reshape(B * T, C-1, -1)
+            #memory = x.reshape(B * T, 1, -1)  # (B*T, 1, dim)
+            #memory_broadcast = memory.expand(-1, C-1, -1)  
+            y = self.char_transformer.drop(combined)  
+            for block in self.char_transformer.h:
+                y = block(y)
+            y = self.char_transformer.ln_f(y)
+                 # (1, i, D)
+            logits = self.lm_head(y)                                                    # (1, i, vocab)
+            logit_i = logits[0, -1]                                                      # (vocab,)
+
+            # Sample next character
+            probs = torch.softmax(logit_i, dim=-1)
+            next_char = torch.multinomial(probs/0.8, num_samples=1).item()
+            #next_char = torch.argmax(probs, dim=-1).item()
+
+            next_token.append(next_char)
+
+            if i == 4:
+                try:
+                    chars_to_token(next_token[1:])
+                    flag = False
+                except KeyError:
+                    next_token = [char_to_id['<SOS>']]
+                    i = 0
+            i += 1
+        
+
+
+        return next_token[1:]
+    
+
+
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
-        """
-        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
-        the sequence max_new_tokens times, feeding the predictions back into the model each time.
-        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
-        """
-        for _ in range(max_new_tokens):
-            # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
-            # pluck the logits at the final step and scale by desired temperature
-            logits = logits[:, -1, :] / temperature
-            # optionally crop the logits to only the top k options
-            if top_k is not None:
-                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-                logits[logits < v[:, [-1]]] = -float('Inf')
-            # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
-            # sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)
-            # append sampled index to the running sequence and continue
-            idx = torch.cat((idx, idx_next), dim=1)
+    def generate(self, idx, max_new_tokens, device, temperature=1.0, top_k=None):
+        
+        start_ids = [chunk_to_id['Firs'], chunk_to_id['t Ci']]
+        idx = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # if the sequence context is growing too long we must crop it at block_size
+                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+                # forward the model to get the logits for the index in the sequence
+                latent_vecs, _ = self(idx_cond)
+
+                last_latent = latent_vecs[:, -1:, :]  # (1, 1, D)
+
+                
+                prev_chars = token_to_char_ids(idx_cond[0, -2].item())
+                current_chars = token_to_char_ids(idx_cond[0, -1].item())
+
+                a = prev_chars + current_chars
+                a = a[3:8]
+
+                pred_char_ids = self.get_token_multinomial(last_latent, current_chars, device)
+
+
+
+                token_ids = chars_to_token(pred_char_ids)
+
+                if token_ids == []:
+                    continue
+                idx = torch.cat((idx, torch.tensor(token_ids, device=device).unsqueeze(0)), dim=1)
 
         return idx
+    
+# TODO Sometimes multiple tokens are returned
+# I am only returning the first token but maybe we should return all of them?
+def chars_to_token(char_list):
+    if len(char_list) < 3:
+        return []
+    token = '' 
+    for char in char_list:
+        token += id_to_char[char]
+
+    token_ids = chunk_to_id[token]
+
+    return [token_ids]
+
+
+def token_to_char_ids(token_id):
+    char_ids = []
+    token = id_to_chunk[token_id]
+    for char in token:
+        char_ids.append(char_to_id[char])
+        
+    return char_ids

@@ -21,6 +21,7 @@ import time
 import math
 import pickle
 from contextlib import nullcontext
+import tiktoken
 from torch.nn import functional as F
 
 import numpy as np
@@ -35,7 +36,7 @@ from model import GPTConfig, GPT
 # I/O
 out_dir = 'out'
 eval_interval = 2000
-log_interval = 100
+log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
@@ -55,6 +56,12 @@ n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
+charset_size = None
+max_token_length = None
+charset = None
+char_to_id = None
+enc = tiktoken.get_encoding("gpt2")
+
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -71,13 +78,51 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+compile = False #True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
 # -----------------------------------------------------------------------------
+
+
+import json
+import pickle
+import numpy as np
+
+# Load vocab
+with open("vocab.json", "r") as f:
+    vocab = json.load(f)
+
+with open("char_vocab.json", "r") as f:
+    char_to_id = json.load(f)
+id_to_char = {int(i): ch for ch, i in char_to_id.items()}
+
+# Rebuild mappings
+chunk_to_id = {chunk: i for i, chunk in enumerate(vocab)}
+id_to_chunk = {i: chunk for i, chunk in enumerate(vocab)}
+
+def encode(text, k=4):
+    """Convert raw string into list of token IDs (with padding)."""
+    chunks = [text[i:i+k] for i in range(0, len(text), k)]
+    if len(chunks[-1]) < k:
+        chunks[-1] = chunks[-1].ljust(k, '\0')  # pad with nulls
+    return [chunk_to_id[chunk] for chunk in chunks]
+
+def decode(ids):
+    """Convert list of token IDs back into a string."""
+    chunks = [id_to_chunk[i] for i in ids]
+    return ''.join(chunk.rstrip('\0') for chunk in chunks)  # remove padding
+
+def encode_chars(text):
+    """Convert string to list of character IDs."""
+    return [char_to_id.get(c, 0) for c in text]  # unknown chars map to 0 (pad)
+
+def decode_chars(id_list):
+    """Convert list of character IDs back to string."""
+    return ''.join(id_to_char.get(i, '') for i in id_list if i != 0)
+
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -112,6 +157,23 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+
+# Function to convert one token sequence to padded char ID tensor
+def tokens_to_char_ids(token_ids, id_to_token, char_to_id):
+    B, T = token_ids.shape
+    C = len(id_to_token[0])  # length of each token (e.g., 4)
+
+    char_id_tensor = torch.zeros((B, T, C+1), dtype=torch.long)
+
+    for b in range(B):
+        for t in range(T):
+            token_pair = id_to_token[token_ids[b, t].item()] 
+            char_id_tensor[b, t, 0] = char_to_id['<SOS>'] 
+            for c in range(1, C):
+                char_id_tensor[b, t, c+1] = char_to_id[token_pair[c]]
+    
+    return char_id_tensor
+
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
 def get_batch(split):
@@ -124,6 +186,11 @@ def get_batch(split):
     ix = torch.randint(len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
+    
+    char_targets = tokens_to_char_ids(y, id_to_chunk, char_to_id)
+
+    y = char_targets
+
     if device_type == 'cuda':
         # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
         x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
@@ -147,13 +214,18 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+model_args['charset_size'] = charset_size
+model_args['max_token_length'] = max_token_length
+id_to_char = {idx: ch for ch, idx in char_to_id.items()}
+
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     # determine the vocab size we'll use for from-scratch training
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 31729
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -242,7 +314,6 @@ def get_lr(it):
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff ranges 0..1
     return min_lr + coeff * (learning_rate - min_lr)
 
-
 def log_all(iter_num, train_loss, val_loss, lr, val_perplexity):
     log_path = os.path.join(out_dir, 'log.txt')
     with open(log_path, 'a') as f:
@@ -259,9 +330,11 @@ if wandb_log and master_process:
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
 t0 = time.time()
+tq0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
 start = time.time()
 while True:
 
@@ -277,13 +350,14 @@ while True:
             X, Y = get_batch('val')
             logits, loss = model(X, Y)
             B, T, V = logits.shape
+            #V = V-1
 
             logits_flat = logits.view(B * T, V)        # [B*T, vocab_size]
-            targets_flat = Y.view(B * T) 
+            targets_flat = Y[:, :, 1:].reshape(B * T)
 
             val_loss = F.cross_entropy(logits_flat, targets_flat, reduction='mean')
             val_perplexity = torch.exp(val_loss)
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, perp: {val_perplexity}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -293,8 +367,11 @@ while True:
                 "mfu": running_mfu*100, # convert to percentage
             })
         log_all(iter_num, losses['train'], losses['val'], lr, val_perplexity)
-
-
+        file_log = True
+        if file_log:
+            t2 = time.time()
+            with open('log.csv', 'a') as f:
+                f.write(f"{iter_num},{losses['train']},{losses['val']},{t2-tq0}\n")
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -356,9 +433,7 @@ while True:
     if iter_num > max_iters:
         break
 
-
 end = time.time()
 print(f"training took {end - start:.2f} seconds")
 if ddp:
-    
     destroy_process_group()

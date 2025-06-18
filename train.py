@@ -347,16 +347,27 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         with torch.no_grad():
-            X, Y = get_batch('val')
-            logits, loss = model(X, Y)
-            B, T, V = logits.shape
-            #V = V-1
+            X, Y = get_batch('val')  # X is subword tokens, Y is (B, T, C) character targets
 
-            logits_flat = logits.view(B * T, V)        # [B*T, vocab_size]
-            targets_flat = Y[:, :, 1:].reshape(B * T)
+            logits, _ = model(X, Y)  # logits: (B*T, C-1, vocab_size)
 
-            val_loss = F.cross_entropy(logits_flat, targets_flat, reduction='mean')
+            B, T, C = Y.shape
+            V = logits.size(-1)
+
+            # Flatten logits: (B*T*(C-1), vocab_size)
+            logits_flat = logits.reshape(-1, V)
+
+            # Targets are the next characters
+            targets_flat = Y[:, :, 1:].reshape(-1)  # (B*T*(C-1),)
+
+            # Compute loss
+            val_loss = F.cross_entropy(logits_flat, targets_flat, reduction='mean', ignore_index=-100)
+
+            # Compute perplexity
             val_perplexity = torch.exp(val_loss)
+
+            print(f"Validation loss: {val_loss.item():.4f}")
+            print(f"Validation perplexity: {val_perplexity.item():.4f}")
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({

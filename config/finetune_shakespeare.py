@@ -21,12 +21,12 @@ max_iters = 500
 # finetune at constant LR
 learning_rate = 3e-5
 decay_lr = False
-device = 'cuda'
+device = 'mps'
 max_token_length = 16 + 2 # For <SOS> and <EOS> tokens
 
-n_layer = 8
-n_head = 8
-n_embd = 384
+n_layer = 4
+n_head = 4
+n_embd = 128
 block_size = 128
 dropout = 0.1
 charset = "\n !$&',-.3:;?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
